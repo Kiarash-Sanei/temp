@@ -5,31 +5,3 @@ all:
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-
-load:
-	sudo insmod EXP8_1_syscall_list.ko
-	@echo ""
-	@echo "✓ Module loaded"
-	@echo "View syscalls:"
-	@echo "  cat /proc/syscalls | head -20"
-
-unload:
-	sudo rmmod EXP8_1_syscall_list
-
-test:
-	make clean && make
-	@echo ""
-	@echo "=== Experiment 8.1: System Calls List ==="
-	@echo ""
-	sudo insmod EXP8_1_syscall_list.ko
-	@sleep 1
-	@echo "Total syscalls:"
-	@cat /proc/syscalls | tail -1
-	@echo ""
-	@echo "First 15 syscalls:"
-	@cat /proc/syscalls | head -15
-	@echo ""
-	sudo rmmod EXP8_1_syscall_list
-	make clean
-
-.PHONY: all clean load unload test

