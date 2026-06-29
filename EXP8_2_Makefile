@@ -1,0 +1,54 @@
+obj-m += EXP8_2_hook_getdents.o
+
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+
+load:
+	sudo insmod EXP8_2_hook_getdents.ko
+	@echo ""
+	@echo "✓ Hook module loaded"
+	@echo "Hidden files: .hidden_file, .secret, rootkit"
+	@echo ""
+	@echo "Test:"
+	@echo "  touch /tmp/.secret"
+	@echo "  ls -la /tmp/ (file should be hidden)"
+
+unload:
+	sudo rmmod EXP8_2_hook_getdents
+
+test:
+	make clean && make
+	@echo ""
+	@echo "=== Experiment 8.2: Hook getdents64 ==="
+	@echo ""
+	@echo "Creating test files..."
+	@mkdir -p /tmp/exp8_test
+	@touch /tmp/exp8_test/.secret
+	@touch /tmp/exp8_test/.hidden_file
+	@touch /tmp/exp8_test/rootkit
+	@touch /tmp/exp8_test/visible.txt
+	@echo ""
+	@echo "Before hook:"
+	@ls -la /tmp/exp8_test/
+	@echo ""
+	@echo "Loading hook module..."
+	sudo insmod EXP8_2_hook_getdents.ko
+	@sleep 1
+	@echo ""
+	@echo "After hook (files should be hidden):"
+	@ls -la /tmp/exp8_test/
+	@echo ""
+	@echo "Unloading..."
+	sudo rmmod EXP8_2_hook_getdents
+	@sleep 1
+	@echo ""
+	@echo "After unload (files should reappear):"
+	@ls -la /tmp/exp8_test/
+	@echo ""
+	@rm -rf /tmp/exp8_test
+	make clean
+
+.PHONY: all clean load unload test
